@@ -1,366 +1,235 @@
 name: Build O2Dialer APK
 
+# يبني التطبيق من ملف O2Dialer*.zip الموجود في جذر الريبو (من غير ما تفكه).
+# - Release موقّع (لو ضفت الـ Secrets)  أو  Debug (لو مفيش Secrets)
+# - لو رفعت نسخة أحدث (V9, V10 ...) بياخد أحدث zip تلقائيًا.
+
 on:
   push:
-    branches:
-      - "**"
+    branches: [main, master]
+    paths:
+      - "O2Dialer*.zip"
+      - ".github/workflows/build.yml"
+    tags: ["v*"]
   workflow_dispatch:
-
-permissions:
-  contents: read
+    inputs:
+      build_type:
+        description: "نوع البناء"
+        type: choice
+        options: [release, debug]
+        default: release
+      publish_release:
+        description: "انشر الـ APK في GitHub Releases"
+        type: boolean
+        default: false
 
 concurrency:
-  group: o2dialer-build-${{ github.ref }}
+  group: build-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: write # مطلوب فقط لنشر الـ Release
+
+env:
+  JAVA_VERSION: "17"
+  GRADLE_VERSION: "8.5"
+  BUILD_TYPE: ${{ inputs.build_type || 'release' }}
 
 jobs:
   build:
-    name: Build O2Dialer
+    name: Build APK
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
-      # ------------------------------------------------------------
-      # 1. Checkout
-      # ------------------------------------------------------------
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------
-      # 2. Find ZIP
-      # ------------------------------------------------------------
-      - name: Find O2Dialer ZIP
-        id: zip
+      # ---------- 1) فك الـ zip وتحديد جذر المشروع ----------
+      - name: Prepare project from zip
+        id: prepare
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Searching for ZIP files..."
+          ZIP="$(ls -1 O2Dialer*.zip 2>/dev/null | sort -V | tail -n1 || true)"
+          SRC="$RUNNER_TEMP/src"
+          rm -rf "$SRC" && mkdir -p "$SRC"
 
-          mapfile -t ZIP_FILES < <(
-            find . \
-              -type f \
-              -iname "*.zip" \
-              -not -path "./.git/*" \
-              -print
-          )
-
-          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
-            echo "::error::No ZIP file was found in the repository."
-            echo ""
-            echo "Repository contents:"
-            find . -maxdepth 3 -type f -print | sort
+          if [ -n "$ZIP" ]; then
+            echo "Using archive: $ZIP"
+            unzip -q "$ZIP" -d "$SRC"
+            SETTINGS="$(find "$SRC" -maxdepth 3 -name 'settings.gradle.kts' -not -path '*/__MACOSX/*' | head -n1)"
+          elif [ -f settings.gradle.kts ]; then
+            echo "No zip found - using repository root as project"
+            SETTINGS="$PWD/settings.gradle.kts"
+          else
+            echo "::error::No O2Dialer*.zip at repo root and no settings.gradle.kts found."
             exit 1
           fi
 
-          echo "ZIP files found:"
-          printf '%s\n' "${ZIP_FILES[@]}"
-
-          # Prefer a file containing O2Dialer in its name.
-          ZIP_FILE=""
-
-          for file in "${ZIP_FILES[@]}"; do
-            if [[ "$(basename "$file")" == *O2Dialer* ]]; then
-              ZIP_FILE="$file"
-              break
-            fi
-          done
-
-          # Fallback to the first ZIP if no O2Dialer-named ZIP exists.
-          if [ -z "$ZIP_FILE" ]; then
-            ZIP_FILE="${ZIP_FILES[0]}"
-          fi
-
-          echo ""
-          echo "Selected ZIP:"
-          echo "$ZIP_FILE"
-
-          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
-
-      # ------------------------------------------------------------
-      # 3. Extract project
-      # ------------------------------------------------------------
-      - name: Extract O2Dialer project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          rm -rf extracted
-          mkdir -p extracted
-
-          echo "Extracting:"
-          echo "${{ steps.zip.outputs.zip_file }}"
-
-          unzip -q "${{ steps.zip.outputs.zip_file }}" -d extracted
-
-          echo ""
-          echo "Extraction completed."
-
-          echo ""
-          echo "Top-level extracted contents:"
-          find extracted -maxdepth 3 -print | sort | head -300
-
-      # ------------------------------------------------------------
-      # 4. Locate Android project
-      # ------------------------------------------------------------
-      - name: Locate Android project
-        id: project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Searching for settings.gradle / settings.gradle.kts..."
-
-          SETTINGS_FILE=$(
-            find extracted \
-              -type f \
-              \( \
-                -name "settings.gradle" \
-                -o \
-                -name "settings.gradle.kts" \
-              \) \
-              -print \
-              -quit
-          )
-
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::No settings.gradle or settings.gradle.kts was found inside the ZIP."
-
-            echo ""
-            echo "Extracted files:"
-            find extracted -type f -print | sort | head -500
-
+          if [ -z "${SETTINGS:-}" ]; then
+            echo "::error::settings.gradle.kts not found inside the archive."
             exit 1
           fi
 
-          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          ROOT="$(dirname "$SETTINGS")"
+          VERSION_NAME="$(grep -oP 'versionName\s*=\s*"\K[^"]+' "$ROOT/app/build.gradle.kts" | head -n1)"
+          VERSION_CODE="$(grep -oP 'versionCode\s*=\s*\K[0-9]+' "$ROOT/app/build.gradle.kts" | head -n1)"
 
-          echo "Gradle settings file:"
-          echo "$SETTINGS_FILE"
+          {
+            echo "root=$ROOT"
+            echo "zip=${ZIP:-none}"
+            echo "version_name=${VERSION_NAME:-0}"
+            echo "version_code=${VERSION_CODE:-0}"
+          } >> "$GITHUB_OUTPUT"
 
-          echo ""
-          echo "Android project directory:"
-          echo "$PROJECT_DIR"
+          echo "Project root : $ROOT"
+          echo "Version      : ${VERSION_NAME:-?} (${VERSION_CODE:-?})"
 
-          # Verify root Gradle build file.
-          if [ ! -f "$PROJECT_DIR/build.gradle.kts" ] &&
-             [ ! -f "$PROJECT_DIR/build.gradle" ]; then
-            echo "::error::No root build.gradle or build.gradle.kts found."
-            exit 1
-          fi
-
-          # Verify Android app module.
-          if [ ! -d "$PROJECT_DIR/app" ]; then
-            echo "::error::No app directory found."
-            echo ""
-            echo "Project contents:"
-            find "$PROJECT_DIR" -maxdepth 3 -print | sort
-            exit 1
-          fi
-
-          echo ""
-          echo "Android project detected successfully."
-
-          echo ""
-          echo "Project contents:"
-          ls -la "$PROJECT_DIR"
-
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-
-      # ------------------------------------------------------------
-      # 5. Setup Java
-      # ------------------------------------------------------------
-      - name: Setup Java 17
+      # ---------- 2) البيئة ----------
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: ${{ env.JAVA_VERSION }}
 
-      # ------------------------------------------------------------
-      # 6. Setup Gradle
-      # ------------------------------------------------------------
-      - name: Setup Gradle 8.5
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: "8.5"
-          cache-disabled: true
-
-      # ------------------------------------------------------------
-      # 7. Setup Android SDK
-      # ------------------------------------------------------------
       - name: Accept Android SDK licenses
         shell: bash
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          build-root-directory: ${{ steps.prepare.outputs.root }}
+
+      # ---------- 3) مفتاح التوقيع ----------
+      - name: Restore signing keystore
+        id: signing
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
           set -euo pipefail
+          if [ "$BUILD_TYPE" = "release" ] \
+             && [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Signing: release keystore restored"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            if [ "$BUILD_TYPE" = "release" ]; then
+              echo "::warning::Signing secrets missing -> falling back to DEBUG build. Add KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD."
+            fi
+          fi
 
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            --licenses > /dev/null || true
-
-      - name: Install Android SDK
+      # ---------- 4) البناء ----------
+      - name: Build with Gradle
         shell: bash
-        run: |
-          set -euo pipefail
-
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
-
-      # ------------------------------------------------------------
-      # 8. Project information
-      # ------------------------------------------------------------
-      - name: Show build environment
-        working-directory: ${{ steps.project.outputs.project_dir }}
-        shell: bash
-        run: |
-          echo "========================================"
-          echo "BUILD ENVIRONMENT"
-          echo "========================================"
-
-          echo "Java:"
-          java -version
-
-          echo ""
-          echo "Gradle:"
-          gradle --version
-
-          echo ""
-          echo "Android project:"
-          pwd
-
-          echo ""
-          echo "Gradle files:"
-          find . -maxdepth 3 -type f \
-            \( \
-              -name "settings.gradle*" \
-              -o \
-              -name "build.gradle*" \
-              -o \
-              -name "gradle.properties" \
-            \) \
-            -print | sort
-
-      # ------------------------------------------------------------
-      # 9. Clean
-      # ------------------------------------------------------------
-      - name: Clean project
-        working-directory: ${{ steps.project.outputs.project_dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          gradle clean \
-            --no-daemon \
-            --console=plain
-
-      # ------------------------------------------------------------
-      # 10. Compile Kotlin
-      # ------------------------------------------------------------
-      - name: Compile Kotlin
-        working-directory: ${{ steps.project.outputs.project_dir }}
-        shell: bash
+        working-directory: ${{ steps.prepare.outputs.root }}
         run: |
           set -o pipefail
-
-          echo "Compiling Kotlin..."
-
-          gradle compileDebugKotlin \
-            --no-daemon \
-            --console=plain \
-            --stacktrace \
-            --info \
-            2>&1 | tee kotlin-build.log
-
-      # ------------------------------------------------------------
-      # 11. Build Debug APK
-      # ------------------------------------------------------------
-      - name: Build Debug APK
-        working-directory: ${{ steps.project.outputs.project_dir }}
-        shell: bash
-        run: |
-          set -o pipefail
-
-          echo "Building Debug APK..."
-
-          gradle assembleDebug \
-            --no-daemon \
-            --console=plain \
-            --stacktrace \
-            --info \
-            2>&1 | tee build.log
-
-      # ------------------------------------------------------------
-      # 12. Verify APK
-      # ------------------------------------------------------------
-      - name: Verify APK
-        id: apk
-        working-directory: ${{ steps.project.outputs.project_dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APK="app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ ! -f "$APK" ]; then
-            echo "::error::APK was not generated."
-
-            echo ""
-            echo "Available build outputs:"
-            find app/build/outputs -type f -print 2>/dev/null || true
-
+          if [ "${{ steps.signing.outputs.enabled }}" = "true" ]; then
+            TASK="assembleRelease"
+          else
+            TASK="assembleDebug"
+          fi
+          echo "Gradle task: $TASK"
+          if ! gradle "$TASK" --no-daemon --console=plain --stacktrace 2>&1 | tee "$RUNNER_TEMP/build.log"; then
+            echo "=== KOTLIN / COMPILER ERRORS ==="
+            grep -E "^e: " "$RUNNER_TEMP/build.log" | head -50 || true
+            echo "=== GRADLE FAILURE ==="
+            grep -A 12 "What went wrong" "$RUNNER_TEMP/build.log" | head -40 || true
             exit 1
           fi
 
-          echo ""
-          echo "========================================"
-          echo "O2Dialer BUILD SUCCESSFUL"
-          echo "========================================"
+      # ---------- 5) التوقيع والتحقق ----------
+      - name: Align, sign and verify (release)
+        if: steps.signing.outputs.enabled == 'true'
+        shell: bash
+        working-directory: ${{ steps.prepare.outputs.root }}
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS_RAW: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n1)"
+          UNSIGNED="$(find app/build/outputs/apk/release -name '*-unsigned.apk' | head -n1)"
+          [ -n "$UNSIGNED" ] || { echo "::error::Unsigned release APK not found"; exit 1; }
 
-          echo ""
-          echo "APK:"
-          ls -lh "$APK"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          OUT="$GITHUB_WORKSPACE/dist/O2Dialer-v${{ steps.prepare.outputs.version_name }}-${{ steps.prepare.outputs.version_code }}-release.apk"
 
-          echo ""
-          echo "APK path:"
-          realpath "$APK"
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          KEY_PASS="${KEY_PASS_RAW:-$KS_PASS}" "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KS_PASS \
+            --key-pass env:KEY_PASS \
+            --v2-signing-enabled true --v3-signing-enabled true \
+            --out "$OUT" "$RUNNER_TEMP/aligned.apk"
 
-          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          "$BT/apksigner" verify --verbose --print-certs "$OUT"
+          "$BT/zipalign" -c -p 4 "$OUT" && echo "zipalign: OK"
+          rm -f "$RUNNER_TEMP/release.jks"
 
-      # ------------------------------------------------------------
-      # 13. Upload APK
-      # ------------------------------------------------------------
-      - name: Upload O2Dialer APK
+      - name: Collect debug APK
+        if: steps.signing.outputs.enabled != 'true'
+        shell: bash
+        working-directory: ${{ steps.prepare.outputs.root }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp app/build/outputs/apk/debug/app-debug.apk \
+            "$GITHUB_WORKSPACE/dist/O2Dialer-v${{ steps.prepare.outputs.version_name }}-${{ steps.prepare.outputs.version_code }}-debug.apk"
+
+      - name: Checksum and summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.apk | tee SHA256SUMS.txt
+          {
+            echo "## O2Dialer v${{ steps.prepare.outputs.version_name }} (build ${{ steps.prepare.outputs.version_code }})"
+            echo ""
+            echo "- Source: \`${{ steps.prepare.outputs.zip }}\`"
+            echo "- Type: **$( [ '${{ steps.signing.outputs.enabled }}' = 'true' ] && echo 'Release (signed)' || echo 'Debug' )**"
+            echo "- Size: $(du -h *.apk | cut -f1)"
+            echo ""
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- 6) النتائج ----------
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: O2Dialer-APK
-          path: ${{ steps.project.outputs.project_dir }}/app/build/outputs/apk/debug/app-debug.apk
+          path: dist/*
           if-no-files-found: error
           retention-days: 30
 
-      # ------------------------------------------------------------
-      # 14. Upload build logs
-      # ------------------------------------------------------------
-      - name: Upload build logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: O2Dialer-Build-Logs
-          path: |
-            ${{ steps.project.outputs.project_dir }}/build.log
-            ${{ steps.project.outputs.project_dir }}/kotlin-build.log
-          if-no-files-found: ignore
-          retention-days: 14
-
-      # ------------------------------------------------------------
-      # 15. Upload Gradle reports if build fails
-      # ------------------------------------------------------------
-      - name: Upload Gradle reports
+      - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: O2Dialer-Gradle-Reports
-          path: |
-            ${{ steps.project.outputs.project_dir }}/app/build/reports/
-            ${{ steps.project.outputs.project_dir }}/app/build/tmp/
+          name: build-log
+          path: ${{ runner.temp }}/build.log
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 7
+
+      - name: Publish GitHub Release
+        if: >-
+          steps.signing.outputs.enabled == 'true' &&
+          (startsWith(github.ref, 'refs/tags/v') || inputs.publish_release == true)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}-{1}', steps.prepare.outputs.version_name, steps.prepare.outputs.version_code) }}
+          name: O2Dialer v${{ steps.prepare.outputs.version_name }}
+          files: dist/*
+          generate_release_notes: true
