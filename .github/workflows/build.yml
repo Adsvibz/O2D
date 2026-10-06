@@ -1,235 +1,55 @@
-name: Build O2Dialer APK
-
-# يبني التطبيق من ملف O2Dialer*.zip الموجود في جذر الريبو (من غير ما تفكه).
-# - Release موقّع (لو ضفت الـ Secrets)  أو  Debug (لو مفيش Secrets)
-# - لو رفعت نسخة أحدث (V9, V10 ...) بياخد أحدث zip تلقائيًا.
+name: Build APK
 
 on:
   push:
-    branches: [main, master]
-    paths:
-      - "O2Dialer*.zip"
-      - ".github/workflows/build.yml"
-    tags: ["v*"]
+  pull_request:
   workflow_dispatch:
-    inputs:
-      build_type:
-        description: "نوع البناء"
-        type: choice
-        options: [release, debug]
-        default: release
-      publish_release:
-        description: "انشر الـ APK في GitHub Releases"
-        type: boolean
-        default: false
 
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: write # مطلوب فقط لنشر الـ Release
-
-env:
-  JAVA_VERSION: "17"
-  GRADLE_VERSION: "8.5"
-  BUILD_TYPE: ${{ inputs.build_type || 'release' }}
-
 jobs:
   build:
-    name: Build APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ---------- 1) فك الـ zip وتحديد جذر المشروع ----------
-      - name: Prepare project from zip
-        id: prepare
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ZIP="$(ls -1 O2Dialer*.zip 2>/dev/null | sort -V | tail -n1 || true)"
-          SRC="$RUNNER_TEMP/src"
-          rm -rf "$SRC" && mkdir -p "$SRC"
-
-          if [ -n "$ZIP" ]; then
-            echo "Using archive: $ZIP"
-            unzip -q "$ZIP" -d "$SRC"
-            SETTINGS="$(find "$SRC" -maxdepth 3 -name 'settings.gradle.kts' -not -path '*/__MACOSX/*' | head -n1)"
-          elif [ -f settings.gradle.kts ]; then
-            echo "No zip found - using repository root as project"
-            SETTINGS="$PWD/settings.gradle.kts"
-          else
-            echo "::error::No O2Dialer*.zip at repo root and no settings.gradle.kts found."
-            exit 1
-          fi
-
-          if [ -z "${SETTINGS:-}" ]; then
-            echo "::error::settings.gradle.kts not found inside the archive."
-            exit 1
-          fi
-
-          ROOT="$(dirname "$SETTINGS")"
-          VERSION_NAME="$(grep -oP 'versionName\s*=\s*"\K[^"]+' "$ROOT/app/build.gradle.kts" | head -n1)"
-          VERSION_CODE="$(grep -oP 'versionCode\s*=\s*\K[0-9]+' "$ROOT/app/build.gradle.kts" | head -n1)"
-
-          {
-            echo "root=$ROOT"
-            echo "zip=${ZIP:-none}"
-            echo "version_name=${VERSION_NAME:-0}"
-            echo "version_code=${VERSION_CODE:-0}"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "Project root : $ROOT"
-          echo "Version      : ${VERSION_NAME:-?} (${VERSION_CODE:-?})"
-
-      # ---------- 2) البيئة ----------
-      - name: Set up JDK
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: 17
 
-      - name: Accept Android SDK licenses
-        shell: bash
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - uses: android-actions/setup-android@v3
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: ${{ env.GRADLE_VERSION }}
-          build-root-directory: ${{ steps.prepare.outputs.root }}
+          gradle-version: 8.5
 
-      # ---------- 3) مفتاح التوقيع ----------
-      - name: Restore signing keystore
-        id: signing
-        shell: bash
-        env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      - name: Build debug APK
         run: |
-          set -euo pipefail
-          if [ "$BUILD_TYPE" = "release" ] \
-             && [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "Signing: release keystore restored"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            if [ "$BUILD_TYPE" = "release" ]; then
-              echo "::warning::Signing secrets missing -> falling back to DEBUG build. Add KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD."
-            fi
+          set +e
+          gradle assembleDebug --no-daemon --console=plain --stacktrace > build.log 2>&1
+          status=$?
+          if [ $status -ne 0 ]; then
+            echo "=== KOTLIN / COMPILE ERRORS ==="
+            grep -E "^e: |error:|FAILED|What went wrong" -A3 build.log | head -80
+            echo "=== LAST 40 LINES ==="
+            tail -40 build.log
           fi
+          exit $status
 
-      # ---------- 4) البناء ----------
-      - name: Build with Gradle
-        shell: bash
-        working-directory: ${{ steps.prepare.outputs.root }}
-        run: |
-          set -o pipefail
-          if [ "${{ steps.signing.outputs.enabled }}" = "true" ]; then
-            TASK="assembleRelease"
-          else
-            TASK="assembleDebug"
-          fi
-          echo "Gradle task: $TASK"
-          if ! gradle "$TASK" --no-daemon --console=plain --stacktrace 2>&1 | tee "$RUNNER_TEMP/build.log"; then
-            echo "=== KOTLIN / COMPILER ERRORS ==="
-            grep -E "^e: " "$RUNNER_TEMP/build.log" | head -50 || true
-            echo "=== GRADLE FAILURE ==="
-            grep -A 12 "What went wrong" "$RUNNER_TEMP/build.log" | head -40 || true
-            exit 1
-          fi
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
-      # ---------- 5) التوقيع والتحقق ----------
-      - name: Align, sign and verify (release)
-        if: steps.signing.outputs.enabled == 'true'
-        shell: bash
-        working-directory: ${{ steps.prepare.outputs.root }}
-        env:
-          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASS_RAW: ${{ secrets.KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          BT="$ANDROID_HOME/build-tools/$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n1)"
-          UNSIGNED="$(find app/build/outputs/apk/release -name '*-unsigned.apk' | head -n1)"
-          [ -n "$UNSIGNED" ] || { echo "::error::Unsigned release APK not found"; exit 1; }
-
-          mkdir -p "$GITHUB_WORKSPACE/dist"
-          OUT="$GITHUB_WORKSPACE/dist/O2Dialer-v${{ steps.prepare.outputs.version_name }}-${{ steps.prepare.outputs.version_code }}-release.apk"
-
-          "$BT/zipalign" -f -p 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
-          KEY_PASS="${KEY_PASS_RAW:-$KS_PASS}" "$BT/apksigner" sign \
-            --ks "$RUNNER_TEMP/release.jks" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --ks-pass env:KS_PASS \
-            --key-pass env:KEY_PASS \
-            --v2-signing-enabled true --v3-signing-enabled true \
-            --out "$OUT" "$RUNNER_TEMP/aligned.apk"
-
-          "$BT/apksigner" verify --verbose --print-certs "$OUT"
-          "$BT/zipalign" -c -p 4 "$OUT" && echo "zipalign: OK"
-          rm -f "$RUNNER_TEMP/release.jks"
-
-      - name: Collect debug APK
-        if: steps.signing.outputs.enabled != 'true'
-        shell: bash
-        working-directory: ${{ steps.prepare.outputs.root }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/dist"
-          cp app/build/outputs/apk/debug/app-debug.apk \
-            "$GITHUB_WORKSPACE/dist/O2Dialer-v${{ steps.prepare.outputs.version_name }}-${{ steps.prepare.outputs.version_code }}-debug.apk"
-
-      - name: Checksum and summary
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum *.apk | tee SHA256SUMS.txt
-          {
-            echo "## O2Dialer v${{ steps.prepare.outputs.version_name }} (build ${{ steps.prepare.outputs.version_code }})"
-            echo ""
-            echo "- Source: \`${{ steps.prepare.outputs.zip }}\`"
-            echo "- Type: **$( [ '${{ steps.signing.outputs.enabled }}' = 'true' ] && echo 'Release (signed)' || echo 'Debug' )**"
-            echo "- Size: $(du -h *.apk | cut -f1)"
-            echo ""
-            echo '```'
-            cat SHA256SUMS.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # ---------- 6) النتائج ----------
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: O2Dialer-APK
-          path: dist/*
+          path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: ${{ runner.temp }}/build.log
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Publish GitHub Release
-        if: >-
-          steps.signing.outputs.enabled == 'true' &&
-          (startsWith(github.ref, 'refs/tags/v') || inputs.publish_release == true)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}-{1}', steps.prepare.outputs.version_name, steps.prepare.outputs.version_code) }}
-          name: O2Dialer v${{ steps.prepare.outputs.version_name }}
-          files: dist/*
-          generate_release_notes: true
