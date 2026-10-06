@@ -1,22 +1,4 @@
-name: Build O2Dialer APK
-
-on:
-  push:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    name: Build O2Dialer
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: DEBUG - Repository Structure
+      - name: Diagnose Android project
         shell: bash
         run: |
           echo "========================================"
@@ -26,112 +8,80 @@ jobs:
 
           echo ""
           echo "========================================"
-          echo "ROOT CONTENTS"
+          echo "ROOT FILES"
           echo "========================================"
           ls -la
 
           echo ""
           echo "========================================"
-          echo "ALL WORKFLOWS"
+          echo "DIRECTORIES"
           echo "========================================"
-          find .github -type f -maxdepth 3 -print 2>/dev/null || true
+          find . -maxdepth 2 -type d -print
 
           echo ""
           echo "========================================"
-          echo "SEARCH FOR O2Dialer PATH REFERENCES"
+          echo "GRADLE FILES"
           echo "========================================"
-          grep -RIn "ls O2Dialer\|working-directory.*O2Dialer\|O2Dialer/" .github 2>/dev/null || true
-
-          echo ""
-          echo "========================================"
-          echo "GRADLE PROJECT"
-          echo "========================================"
-          find . -maxdepth 2 -type f \
-            \( -name "settings.gradle*" -o -name "build.gradle*" \) \
+          find . -type f \
+            \( -name "settings.gradle" \
+            -o -name "settings.gradle.kts" \
+            -o -name "build.gradle" \
+            -o -name "build.gradle.kts" \
+            -o -name "gradle.properties" \) \
             -print
 
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
+          echo ""
+          echo "========================================"
+          echo "ANDROID APP DIRECTORIES"
+          echo "========================================"
+          find . -type d -name app -print
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: "8.5"
-          cache-disabled: true
+          echo ""
+          echo "========================================"
+          echo "CHECKING EXPECTED ROOT"
+          echo "========================================"
 
-      - name: Accept Android licenses
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
+            echo "✓ settings.gradle found"
+          else
+            echo "✗ settings.gradle NOT found"
+          fi
 
-      - name: Install Android SDK
-        run: |
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
+          if [ -f "build.gradle.kts" ] || [ -f "build.gradle" ]; then
+            echo "✓ build.gradle found"
+          else
+            echo "✗ build.gradle NOT found"
+          fi
 
-      - name: Verify Android project
-        run: |
-          set -e
-
-          echo "Checking Android project..."
-
-          test -f settings.gradle.kts || test -f settings.gradle
-          test -f build.gradle.kts || test -f build.gradle
-          test -d app
-
-          echo "Android project detected successfully."
-
-      - name: Clean project
-        run: |
-          gradle clean \
-            --no-daemon \
-            --console=plain
-
-      - name: Build Debug APK
-        run: |
-          set -o pipefail
-
-          gradle assembleDebug \
-            --no-daemon \
-            --console=plain \
-            --stacktrace \
-            2>&1 | tee build.log
-
-      - name: Verify APK
-        run: |
-          APK="app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ ! -f "$APK" ]; then
-            echo "ERROR: APK was not generated."
-            echo ""
-            find app/build/outputs -type f 2>/dev/null || true
-            exit 1
+          if [ -d "app" ]; then
+            echo "✓ app directory found"
+          else
+            echo "✗ app directory NOT found"
           fi
 
           echo ""
           echo "========================================"
-          echo "O2Dialer BUILD SUCCESSFUL"
+          echo "SEARCHING FOR ANDROID PROJECT"
           echo "========================================"
 
-          ls -lh "$APK"
+          PROJECT_SETTINGS=$(find . -type f \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            -print -quit)
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: O2Dialer-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 30
+          if [ -n "$PROJECT_SETTINGS" ]; then
+            echo "Found Gradle project:"
+            echo "$PROJECT_SETTINGS"
 
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: O2Dialer-Build-Log
-          path: build.log
-          if-no-files-found: ignore
-          retention-days: 14
+            PROJECT_DIR=$(dirname "$PROJECT_SETTINGS")
+
+            echo ""
+            echo "Project directory:"
+            echo "$PROJECT_DIR"
+
+            echo ""
+            echo "Project contents:"
+            ls -la "$PROJECT_DIR"
+          else
+            echo "ERROR: No Gradle settings file found anywhere."
+            exit 1
+          fi
