@@ -9,11 +9,15 @@ permissions:
 
 jobs:
   build:
-    name: Build Android APK
+    name: Build O2Dialer
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: O2Dialer
+
     steps:
-      - name: Checkout source
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Java 17
@@ -21,117 +25,80 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
       - name: Setup Gradle 8.5
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: "8.5"
+          cache-disabled: true
 
-      - name: Locate Android project
-        shell: bash
+      - name: Accept Android licenses
+        working-directory: .
         run: |
-          set -e
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
-          if [ -f "settings.gradle.kts" ]; then
-            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
-          elif [ -f "O2Dialer/settings.gradle.kts" ]; then
-            echo "PROJECT_DIR=O2Dialer" >> "$GITHUB_ENV"
-          else
-            echo "ERROR: settings.gradle.kts was not found."
-            echo "Repository structure:"
-            find . -maxdepth 3 -type f \
-              \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
-              -print
-            exit 1
-          fi
-
-      - name: Install required Android SDK
-        shell: bash
+      - name: Install Android SDK
+        working-directory: .
         run: |
-          set -e
-
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses \
-            > /dev/null || true
-
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0"
 
       - name: Verify project
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
         run: |
-          echo "Project directory:"
+          echo "========================================"
+          echo "O2Dialer project"
+          echo "========================================"
           pwd
-
           echo ""
-          echo "Project files:"
           ls -la
-
           echo ""
           echo "Gradle files:"
           find . -maxdepth 2 -type f \
-            \( -name "build.gradle" -o -name "build.gradle.kts" -o -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            \( -name "settings.gradle*" -o -name "build.gradle*" \) \
             -print
 
-      - name: Clean previous build
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Clean build
         run: |
-          gradle clean --no-daemon --console=plain
+          gradle clean \
+            --no-daemon \
+            --console=plain
 
       - name: Build Debug APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
         run: |
           set -o pipefail
 
-          if ! gradle \
-            assembleDebug \
+          gradle assembleDebug \
             --no-daemon \
             --console=plain \
             --stacktrace \
-            2>&1 | tee build.log; then
-
-            echo ""
-            echo "========================================"
-            echo "BUILD FAILED"
-            echo "========================================"
-
-            echo ""
-            echo "=== GRADLE ERRORS ==="
-            grep -E \
-              "e: |ERROR|FAILURE:|What went wrong:|Execution failed|Could not resolve|Could not find" \
-              build.log | head -100 || true
-
-            echo ""
-            echo "=== LAST 150 LINES ==="
-            tail -150 build.log
-
-            exit 1
-          fi
+            2>&1 | tee build.log
 
       - name: Verify APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
         run: |
           APK="app/build/outputs/apk/debug/app-debug.apk"
 
           if [ ! -f "$APK" ]; then
             echo "ERROR: APK was not generated."
+            echo ""
+            echo "Available build outputs:"
             find app/build/outputs -type f 2>/dev/null || true
             exit 1
           fi
 
-          echo "APK successfully created:"
+          echo ""
+          echo "========================================"
+          echo "BUILD SUCCESSFUL"
+          echo "========================================"
+          echo ""
           ls -lh "$APK"
 
-      - name: Upload O2Dialer APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: O2Dialer-APK
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          path: O2Dialer/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
 
@@ -139,7 +106,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: O2Dialer-build-log
-          path: ${{ env.PROJECT_DIR }}/build.log
+          name: O2Dialer-Build-Log
+          path: O2Dialer/build.log
           if-no-files-found: ignore
           retention-days: 14
