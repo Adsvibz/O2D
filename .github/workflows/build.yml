@@ -1,0 +1,50 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+
+      - name: Build APK
+        run: |
+          if ! gradle assembleDebug --no-daemon --console=plain > build.log 2>&1; then
+            echo "========================================"
+            echo "BUILD FAILED"
+            echo "========================================"
+            echo ""
+            echo "=== ERRORS ==="
+            grep -E "^e:|FAILURE:|What went wrong:|Execution failed" build.log | head -80 || true
+            echo ""
+            echo "=== LAST 100 LINES ==="
+            tail -100 build.log
+            exit 1
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: O2Dialer-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
